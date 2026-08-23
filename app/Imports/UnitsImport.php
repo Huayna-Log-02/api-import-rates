@@ -11,10 +11,34 @@ use Carbon\Carbon;
 
 class UnitsImport implements ToCollection, WithHeadingRow
 {
+    /*
+     * Valores por defecto para las columnas NOT NULL de la tabla vehiculos
+     * cuando el Excel no trae la columna o el valor es inválido.
+     */
+    private const TIPO_VEHICULO_DEFECTO = 13; // CAMIÓN (tabla tipo_de_vehiculo)
+    private const MARCA_DEFECTO         = 1;  // Primera marca de la tabla marcas
+
     public function collection(Collection $rows)
     {
 
         DB::transaction(function () use ($rows) {
+
+            /*
+             * RUC de la empresa propia: NO es un proveedor, por eso se omite
+             * y no se busca en la tabla proveedores.
+             */
+            $rucEmpresaPropia = '20538843939';
+
+            // Se buscan los proveedores por su RUC (columna cod_prv de proveedores)
+            $rucs = $rows->pluck('ruc')
+                ->filter()
+                ->map(fn ($valor) => trim((string) $valor))
+                ->unique()
+                ->values();
+
+            $proveedores = DB::table('proveedores')
+                ->whereIn('cod_prv', $rucs)
+                ->pluck('id_prv', 'cod_prv');
 
             $tipoVehiculo = [
                 'CAMION' => 13,
@@ -105,28 +129,44 @@ class UnitsImport implements ToCollection, WithHeadingRow
 
             foreach ($rows as $index => $row) {
 
+                // Se salta solo filas totalmente vacías (relleno del Excel)
                 if (
-                    empty($row['tipo_vehiculo']) || empty($row['marca'])
+                    empty($row['placa']) && empty($row['ruc'])
+                    && empty($row['tipo_vehiculo']) && empty($row['marca'])
                 ) {
                     continue;
                 }
 
+                /*
+                 * Si la columna no existe en el Excel o el valor es inválido,
+                 * se usa el valor por defecto (o null si la columna de la BD lo permite)
+                 * en lugar de detener la importación.
+                 */
                 $tipoVehiculoTxt   = strtoupper(trim($row['tipo_vehiculo'] ?? ''));
-                $tipoVehiculoId   = $tipoVehiculo[$tipoVehiculoTxt] ?? null;
+                $tipoVehiculoId   = $tipoVehiculo[$tipoVehiculoTxt] ?? self::TIPO_VEHICULO_DEFECTO;
 
                 $marcaTxt   = strtoupper(trim($row['marca'] ?? ''));
-                $marcaId   = $marcas[$marcaTxt] ?? null;
+                $marcaId   = $marcas[$marcaTxt] ?? self::MARCA_DEFECTO;
 
                 $combustibleTxt   = strtoupper(trim($row['combustible'] ?? ''));
                 $combustibleId   = $combustibles[$combustibleTxt] ?? null;
 
+                $placa = isset($row['placa']) ? trim($row['placa']) : null;
 
-                if (!$tipoVehiculoId || !$marcaId || !$combustibleId) {
-                    throw new \Exception("Error en fila " . ($index + 2) . ": tipo_vehiculo, marca o combustible inválido");
+                if (empty($placa)) {
+                    throw new \Exception("Error en fila " . ($index + 2) . ": la placa es obligatoria");
                 }
 
+                // Si el RUC es el de la empresa propia no se busca proveedor
+                $ruc = isset($row['ruc']) ? trim($row['ruc']) : null;
+
+                $proveedorId = (!empty($ruc) && $ruc !== $rucEmpresaPropia)
+                    ? ($proveedores[$ruc] ?? null)
+                    : null;
+
                 $driversData[] = [
-                    'pla_veh'         => isset($row['placa']) ? trim($row['placa']) : null,
+                    'pla_veh'         => $placa,
+                    'proveedor_id'    => $proveedorId,
                     'tip_veh'         => $tipoVehiculoId,
                     // Marca
                     'mar_veh'           => $marcaId,
@@ -147,10 +187,30 @@ class UnitsImport implements ToCollection, WithHeadingRow
                 ];
             }
 
-            DB::table('vehiculos')->upsert(
+            $normalizar = fn ($valor) => mb_strtoupper(trim((string) $valor));
+
+            $placas = array_column($driversData, 'pla_veh');
+
+            $placasExistentes = DB::table('vehiculos')
+                ->whereIn('pla_veh', $placas)
+                ->pluck('pla_veh')
+                ->map($normalizar)
+                ->all();
+
+            $nuevos = array_values(array_filter(
                 $driversData,
+                fn ($vehiculo) => !in_array($normalizar($vehiculo['pla_veh']), $placasExistentes, true)
+            ));
+
+            if (empty($nuevos)) {
+                return;
+            }
+
+            DB::table('vehiculos')->upsert(
+                $nuevos,
                 ['pla_veh'],
                 [
+                    'proveedor_id',
                     'tip_veh',
                     'mod_veh',
                     'sch_veh',
